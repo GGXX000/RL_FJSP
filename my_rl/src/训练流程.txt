@@ -1,0 +1,145 @@
+## 训练流程中的函数调用顺序
+
+### 1. 初始化阶段
+
+- `main.py` 中解析命令行参数
+
+- 调用 
+
+  ```
+  train_multi_dataset()
+  ```
+
+   函数（在 utils.py 中）
+
+  - 创建 `JobShopEnv` 实例进行环境初始化
+
+  - 调用 `state_to_graph()` 将初始环境状态转换为图结构
+
+  - 初始化 GNN_DQNAgent，此时调用链：
+
+    - ```
+      GNN_DQNAgent.__init__()
+      ```
+
+      - 创建 policy_net和 target_net（两个 GNN_DQN 实例）
+
+        - ```
+          GNN_DQN.__init__()
+          ```
+
+          - 创建 JobShopGraphEncoder实例
+
+            - ```
+              JobShopGraphEncoder.__init__()
+              ```
+
+              - 创建 GraphAttentionLayer实例（而非 GraphConvLayer）
+                - `GraphAttentionLayer.__init__()`
+
+  - 初始化 `GraphBatchBuffer` 用于经验回放
+
+### 2. 训练循环
+
+对于每个数据集、每个训练回合：
+
+1. 重置环境：`env.reset()`
+
+2. 将状态转换为图表示：`state_to_graph(state, env)`
+
+3. 对于每个步骤，执行以下操作：
+
+   - 获取有效动作：`get_valid_actions(state, env)`
+
+   - 选择动作：agent.act(graph_state)，此时调用链：
+
+     - ```
+       GNN_DQNAgent.act()
+       ```
+
+       - ```
+         policy_net.forward()
+         ```
+
+         （GNN_DQN实例的前向传播）
+
+         - ```
+           graph_encoder.forward()（JobShopGraphEncoder实例的前向传播）
+           ```
+
+           - 对每个图层 layer in self.graph_layer：
+             - 调用 GraphAttentionLayer.forward()
+               1. 线性变换：`h = self.W(x)`
+               2. 计算注意力系数
+               3. 应用掩码和 softmax
+               4. 加权聚合邻居信息
+
+         - `global_encoder.forward()`
+
+         - 合并图表示和全局表示
+
+         - 计算 Q 值
+
+   - 执行动作：`env.step(action)`
+
+   - 将新状态转换为图表示：`state_to_graph(next_state, env)`
+
+   - 存储经验：`agent.remember()`
+
+   - 从经验回放中学习：agent.replay(batch_size)，此时调用链：
+
+     - ```
+       GNN_DQNAgent.replay()
+       ```
+
+       - 对批次中的每个样本：
+         - 使用 `policy_net.forward()` 计算当前 Q 值（使用 `GraphAttentionLayer`）
+         - 使用 `target_net.forward()` 计算目标 Q 值（使用 `GraphAttentionLayer`）
+       - 计算损失和梯度
+       - 执行反向传播：loss.backward()
+         - 这会通过图网络的所有层（包括 `GraphAttentionLayer`）反向传播梯度
+       - 梯度裁剪：`torch.nn.utils.clip_grad_norm_()`
+       - 优化器更新：`optimizer.step()`
+
+4. 定期更新目标网络：`agent.update_target_network()`
+
+5. 定期执行评估：`evaluate_on_datasets()`
+
+### 3. 关键的 GraphAttentionLayer 调用细节
+
+在每次前向传播时，`GraphAttentionLayer.forward()` 的调用顺序：
+
+1. 特征变换：`h = self.W(x)`
+
+2. 准备注意力计算的输入：
+
+   ```
+   pythonCopya_input = torch.cat([h.repeat(...), h.repeat(...)], dim=2)
+   a_input = a_input.view(batch_size, num_nodes, num_nodes, 2 * self.out_features)
+   ```
+
+3. 计算未归一化的注意力系数：`e = self.leakyrelu(self.a(a_input).squeeze(3))`
+
+4. 应用邻接矩阵掩码：`attention = torch.where(adj > 0, e, zero_vec)`
+
+5. 归一化并应用 dropout：
+
+   ```
+   pythonCopyattention = F.softmax(attention, dim=2)
+   attention = F.dropout(attention, self.dropout, training=self.training)
+   ```
+
+6. 使用注意力权重聚合信息：`h_prime = torch.bmm(attention, h)`
+
+### 4. 反向传播时的梯度流
+
+反向传播时的梯度流动路径（从损失到各层参数）：
+
+1. 损失 -> Q 网络输出
+2. Q 网络 -> 合并表示
+3. 合并表示 -> 图表示 + 全局表示
+4. 图表示 -> `JobShopGraphEncoder` 输出
+5. `JobShopGraphEncoder` 输出 -> 各图层的输出
+6. 图层输出 -> GraphAttentionLayer的各参数：
+   - 注意力系数计算中的 `self.a` 参数
+   - 特征变换中的 `self.W` 参数
